@@ -118,12 +118,22 @@ func introspectSchema(ctx context.Context, conn *pgx.Conn) ([]Table, error) {
 		t := &tables[i]
 
 		// Columns
+		// Use pg_catalog to get the correct type definition (e.g. text[] instead of ARRAY)
 		cRows, err := conn.Query(ctx, `
-			SELECT column_name, data_type, is_nullable, column_default
-			FROM information_schema.columns
-			WHERE table_schema = 'public' 
-			  AND table_name = $1
-			ORDER BY ordinal_position
+			SELECT 
+				a.attname, 
+				format_type(a.atttypid, a.atttypmod), 
+				a.attnotnull, 
+				pg_get_expr(d.adbin, d.adrelid)
+			FROM pg_attribute a
+			JOIN pg_class c ON a.attrelid = c.oid
+			JOIN pg_namespace n ON c.relnamespace = n.oid
+			LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+			WHERE n.nspname = 'public' 
+			  AND c.relname = $1
+			  AND a.attnum > 0 
+			  AND NOT a.attisdropped
+			ORDER BY a.attnum
 		`, t.Name)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get columns for table %s: %w", t.Name, err)
@@ -131,9 +141,16 @@ func introspectSchema(ctx context.Context, conn *pgx.Conn) ([]Table, error) {
 
 		for cRows.Next() {
 			var c Column
-			if err := cRows.Scan(&c.Name, &c.DataType, &c.IsNullable, &c.Default); err != nil {
+			var notNull bool
+			if err := cRows.Scan(&c.Name, &c.DataType, &notNull, &c.Default); err != nil {
 				cRows.Close()
 				return nil, err
+			}
+
+			if notNull {
+				c.IsNullable = "NO"
+			} else {
+				c.IsNullable = "YES"
 			}
 
 			// Sanitize Xata specifics
@@ -144,21 +161,16 @@ func introspectSchema(ctx context.Context, conn *pgx.Conn) ([]Table, error) {
 
 			// 3. Handle Sequences (nextval)
 			if c.Default != nil && contains(*c.Default, "nextval(") {
-				if c.DataType == "integer" {
+				// With pg_catalog, format_type should return proper types like 'integer' or 'bigint' or 'text[]'
+				// But we still want to convert auto-incrementing ints to SERIAL for simplicity on destination.
+				if strings.HasPrefix(c.DataType, "integer") || c.DataType == "int4" {
 					c.DataType = "SERIAL"
 					c.Default = nil
-				} else if c.DataType == "bigint" {
+				} else if strings.HasPrefix(c.DataType, "bigint") || c.DataType == "int8" {
 					c.DataType = "BIGSERIAL"
 					c.Default = nil
 				}
-				// If it's some other type with nextval, we might need manual sequence creation,
-				// but usually it's int/bigint.
-				// We'll leave it alone if not int/bigint, which might fail, but let's cover the 99% case.
 			}
-
-			// 2. Map custom Xata types if any (though usually they are just standard types with defaults)
-			// If the type itself is in xata_private (unlikely for standard cols but possible), fall back to text?
-			// For now, let's assume it's mostly the default value causing issues.
 
 			t.Columns = append(t.Columns, c)
 		}
