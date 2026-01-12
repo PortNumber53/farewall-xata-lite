@@ -1,0 +1,8 @@
+# Binaries
+migration-tool
+
+# Env
+.env
+
+# MacOS
+.DS_Store
